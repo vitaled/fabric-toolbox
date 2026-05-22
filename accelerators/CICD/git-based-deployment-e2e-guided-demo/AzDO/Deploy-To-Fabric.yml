@@ -1,0 +1,81 @@
+trigger:
+  branches:
+    include:
+      - main
+
+parameters:
+- name: items_in_scope
+  displayName: Enter Fabric items to be deployed
+  type: string
+  default: '["Notebook","DataPipeline","Lakehouse","SemanticModel","Report","Warehouse"]'
+- name: run_post_deployment
+  displayName: Run post-deployment rebinding (connections, notebooks, semantic models, reports)
+  type: boolean
+  default: true
+- name: mapping_connections_file
+  displayName: Path to connection mapping JSON file (relative to repo root)
+  type: string
+  default: 'scripts/deploy/mapping_connections.json'
+
+variables:
+  # This variable group is linked to Azure Key Vault and secrets contain tenant id, service principal client id, secret
+  - group: Fabric_Deployment_Group_S
+  # This variable group contains the workspace names based on naming convention "[branch]WorkspaceName". It also contains the gitFolder to be referenced in the python script.
+  - group: Fabric_Deployment_Group_NS
+
+stages:
+  - stage: DeployToDev
+    displayName: "Deploy to Dev"
+    jobs:
+      - deployment: DeployDev
+        displayName: "Deploy to Dev Workspace"
+        environment: Dev
+        pool:
+          name: Default
+          demands:
+            - agent.name -equals vm-linux-agent
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - script: |
+                    python3 -m pip install --upgrade pip --break-system-packages
+                    python3 -m pip install fabric-cicd --break-system-packages
+                  displayName: "Install Fabric CICD Library"
+                - script: |
+                    python3 scripts/deploy/deploy-to-fabric.py --aztenantid $(aztenantid) --azclientid $(azclientid) --azspsecret $(azspsecret) --workspace_name $(mainWorkspaceName) --items_in_scope '${{ parameters.items_in_scope }}'
+                  displayName: 'Deploy to Dev'
+                - ${{ if eq(parameters.run_post_deployment, true) }}:
+                  - script: |
+                      python3 scripts/deploy/post_deployment.py --aztenantid $(aztenantid) --azclientid $(azclientid) --azspsecret $(azspsecret) --source_workspace_id $(mainWorkspaceName) --target_workspace_id $(mainWorkspaceName) --target_stage 1 --mapping_connections '${{ parameters.mapping_connections_file }}'
+                    displayName: 'Post-Deployment: Rebind Dev'
+
+  - stage: DeployToTest
+    displayName: "Deploy to Test"
+    dependsOn: DeployToDev
+    condition: succeeded()
+    jobs:
+      - deployment: DeployTest
+        displayName: "Deploy to Test Workspace"
+        environment: Test
+        pool:
+          name: Default
+          demands:
+            - agent.name -equals vm-linux-agent
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - script: |
+                    python3 -m pip install --upgrade pip --break-system-packages
+                    python3 -m pip install fabric-cicd --break-system-packages
+                  displayName: "Install Fabric CICD Library"
+                - script: |
+                    python3 scripts/deploy/deploy-to-fabric.py --aztenantid $(aztenantid) --azclientid $(azclientid) --azspsecret $(azspsecret) --workspace_name $(testWorkspaceName) --items_in_scope '${{ parameters.items_in_scope }}'
+                  displayName: 'Deploy to Test'
+                - ${{ if eq(parameters.run_post_deployment, true) }}:
+                  - script: |
+                      python3 scripts/deploy/post_deployment.py --aztenantid $(aztenantid) --azclientid $(azclientid) --azspsecret $(azspsecret) --source_workspace_id $(mainWorkspaceName) --target_workspace_id $(testWorkspaceName) --target_stage 2 --mapping_connections '${{ parameters.mapping_connections_file }}'
+                    displayName: 'Post-Deployment: Rebind Test'

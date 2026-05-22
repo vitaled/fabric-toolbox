@@ -1,0 +1,8 @@
+[
+    {
+        "_comment": "Map connection IDs or M expressions from Dev (Stage1) to Test (Stage2) and Prod (Stage3)",
+        "ConnectionStage1": "dev-connection-guid-or-m-expression",
+        "ConnectionStage2": "test-connection-guid-or-m-expression",
+        "ConnectionStage3": "prod-connection-guid-or-m-expression"
+    }
+]
