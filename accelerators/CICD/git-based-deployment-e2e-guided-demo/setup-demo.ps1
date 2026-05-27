@@ -567,16 +567,18 @@ git pull origin main 2>$null
 # Step 3.5 — Copy pipeline files into repo
 Write-Info "Copying pipeline and deployment files to repo"
 Copy-Item "$SCRIPT_DIR\AzDO\Deploy-To-Fabric.yml" -Destination "$CLONE_DIR\Deploy-To-Fabric.yml" -Force
+Copy-Item "$SCRIPT_DIR\AzDO\Extract-Lakehouse-Schema.yml" -Destination "$CLONE_DIR\Extract-Lakehouse-Schema.yml" -Force
 New-Item -ItemType Directory -Path "$CLONE_DIR\scripts\deploy" -Force | Out-Null
 Copy-Item "$SCRIPT_DIR\AzDO\scripts\deploy\deploy-to-fabric.py" -Destination "$CLONE_DIR\scripts\deploy\deploy-to-fabric.py" -Force
 Copy-Item "$SCRIPT_DIR\AzDO\scripts\deploy\post_deployment.py" -Destination "$CLONE_DIR\scripts\deploy\post_deployment.py" -Force
+Copy-Item "$SCRIPT_DIR\AzDO\scripts\deploy\extract-lakehouse-schema.ps1" -Destination "$CLONE_DIR\scripts\deploy\extract-lakehouse-schema.ps1" -Force
 if (Test-Path "$SCRIPT_DIR\AzDO\scripts\deploy\mapping_connections.template.json") {
     Copy-Item "$SCRIPT_DIR\AzDO\scripts\deploy\mapping_connections.template.json" -Destination "$CLONE_DIR\scripts\deploy\mapping_connections.template.json" -Force
 }
 
 # Commit and push pipeline files
-git add Deploy-To-Fabric.yml scripts/deploy/
-git commit -m "Add CI/CD pipeline, deployment, and post-deployment scripts"
+git add Deploy-To-Fabric.yml Extract-Lakehouse-Schema.yml scripts/deploy/
+git commit -m "Add CI/CD pipeline, extraction pipeline, deployment, and post-deployment scripts"
 git push origin main 2>$null
 Pop-Location
 
@@ -720,6 +722,36 @@ if (-not $PIPELINE_ID) {
     } catch { }
 }
 
+# Step 3.8b — Create the Extract-Lakehouse-Schema pipeline
+Write-Info "Creating pipeline: Extract-Lakehouse-Schema"
+$EXTRACT_PIPELINE_ID = $null
+try {
+    $extractPipelineJson = az pipelines create `
+        --name "Extract-Lakehouse-Schema" `
+        --repository $AZDO_REPO `
+        --repository-type tfsgit `
+        --branch main `
+        --yml-path Extract-Lakehouse-Schema.yml `
+        --skip-first-run `
+        --output json 2>$null
+    $extractPipelineObj = $extractPipelineJson | ConvertFrom-Json
+    $EXTRACT_PIPELINE_ID = $extractPipelineObj.id
+    Write-Info "Pipeline 'Extract-Lakehouse-Schema' created (ID: $EXTRACT_PIPELINE_ID)"
+} catch {
+    Write-Host "  WARNING: Extract pipeline creation failed — looking up existing pipeline" -ForegroundColor Yellow
+}
+
+if (-not $EXTRACT_PIPELINE_ID) {
+    try {
+        $pipelines = az pipelines list --output json 2>$null | ConvertFrom-Json
+        $existing = $pipelines | Where-Object { $_.name -eq "Extract-Lakehouse-Schema" }
+        if ($existing) {
+            $EXTRACT_PIPELINE_ID = $existing.id
+            Write-Info "Found existing extract pipeline ID: $EXTRACT_PIPELINE_ID"
+        }
+    } catch { }
+}
+
 # Step 3.9 — Add approval gate on 'test' environment
 Write-Info "Looking up 'test' environment ID"
 $TEST_ENV_ID = $null
@@ -781,17 +813,18 @@ if ($PIPELINE_ID) {
     # Grant access to NS group
     $allVarGroups = Invoke-RestMethod -Uri "$AzDoOrg/$AZDO_PROJECT/_apis/distributedtask/variablegroups?api-version=7.1" `
         -Method GET -Headers $azDoHeaders
+    $pipelineIds = @($PIPELINE_ID)
+    if ($EXTRACT_PIPELINE_ID) { $pipelineIds += $EXTRACT_PIPELINE_ID }
     foreach ($vgName in @("Fabric_Deployment_Group_NS", "Fabric_Deployment_Group_S")) {
         $vg = $allVarGroups.value | Where-Object { $_.name -eq $vgName }
         if ($vg) {
             Write-Info "Granting pipeline access to variable group: $vgName"
+            $pipelineArray = @()
+            foreach ($pid in $pipelineIds) {
+                $pipelineArray += @{ id = $pid; authorized = $true }
+            }
             $vgGrantBody = @{
-                pipelines = @(
-                    @{
-                        id         = $PIPELINE_ID
-                        authorized = $true
-                    }
-                )
+                pipelines = $pipelineArray
                 resource = @{ id = "$($vg.id)"; type = "variablegroup" }
             } | ConvertTo-Json -Depth 5
 
@@ -835,15 +868,16 @@ Write-Host ""
 Write-Host "Azure DevOps:" -ForegroundColor White
 Write-Host "  Project:    $AZDO_PROJECT"
 Write-Host "  Repo:       $AZDO_REPO"
-Write-Host "  Pipeline:   Deploy-To-Fabric"
+Write-Host "  Pipelines:  Deploy-To-Fabric, Extract-Lakehouse-Schema"
 Write-Host "  Clone dir:  $CLONE_DIR"
 Write-Host ""
 Write-Host "Item types in scope:" -ForegroundColor White
 Write-Host '  Notebook, DataPipeline, Lakehouse, SemanticModel, Report, Warehouse'
 Write-Host ""
 Write-Host "Next steps:" -ForegroundColor Yellow
-Write-Host "  1. Run a VALIDATION pipeline test: $AzDoOrg/$AZDO_PROJECT/_build (manually trigger on main)"
-Write-Host "  2. Proceed to the live demo (see demo-script.ps1)"
+Write-Host "  1. Run 'Extract-Lakehouse-Schema' pipeline to capture Lakehouse SQL schemas (optional)"
+Write-Host "  2. Run a VALIDATION pipeline test: $AzDoOrg/$AZDO_PROJECT/_build (manually trigger Deploy-To-Fabric on main)"
+Write-Host "  3. Proceed to the live demo (see demo-script.ps1)"
 Write-Host ""
 
 # ============================================================================
@@ -851,21 +885,23 @@ Write-Host ""
 # ============================================================================
 $configFile = Join-Path $SCRIPT_DIR "demo-config.json"
 $config = [ordered]@{
-    RepoPath        = $CLONE_DIR
-    AzDoOrg         = $AzDoOrg
-    AzDoProject     = $AZDO_PROJECT
-    AzDoRepo        = $AZDO_REPO
-    ResourceGroup   = $RESOURCE_GROUP
-    KeyVaultName    = $KV_NAME
-    SpName          = $SP_NAME
-    SpClientId      = $CLIENT_ID
-    TenantId        = $TENANT_ID
-    DevWorkspace    = $DEV_WORKSPACE
-    DevWorkspaceId  = $DEV_WS_ID
-    TestWorkspace   = $TEST_WORKSPACE
-    TestWorkspaceId = $TEST_WS_ID
-    CapacityId      = $CAPACITY_ID
-    ResourcePostfix = $ResourcePostfix
+    RepoPath              = $CLONE_DIR
+    AzDoOrg               = $AzDoOrg
+    AzDoProject           = $AZDO_PROJECT
+    AzDoRepo              = $AZDO_REPO
+    ResourceGroup         = $RESOURCE_GROUP
+    KeyVaultName          = $KV_NAME
+    SpName                = $SP_NAME
+    SpClientId            = $CLIENT_ID
+    TenantId              = $TENANT_ID
+    DevWorkspace          = $DEV_WORKSPACE
+    DevWorkspaceId        = $DEV_WS_ID
+    TestWorkspace         = $TEST_WORKSPACE
+    TestWorkspaceId       = $TEST_WS_ID
+    CapacityId            = $CAPACITY_ID
+    ResourcePostfix       = $ResourcePostfix
+    DeployPipelineId      = $PIPELINE_ID
+    ExtractPipelineId     = $EXTRACT_PIPELINE_ID
 }
 $config | ConvertTo-Json | Out-File -FilePath $configFile -Encoding utf8
 Write-Host "Config file written to: $configFile" -ForegroundColor Green

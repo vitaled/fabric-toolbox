@@ -1,3 +1,6 @@
+pool:
+  name: Default
+
 trigger:
   branches:
     include:
@@ -10,6 +13,10 @@ parameters:
   default: '["Notebook","DataPipeline","Lakehouse","SemanticModel","Report","Warehouse"]'
 - name: run_post_deployment
   displayName: Run post-deployment rebinding (connections, notebooks, semantic models, reports)
+  type: boolean
+  default: true
+- name: deploy_sql_schemas
+  displayName: Build and deploy SQL schemas (DACPAC) for Warehouse and Lakehouse
   type: boolean
   default: true
 - name: mapping_connections_file
@@ -32,24 +39,250 @@ stages:
         environment: Dev
         pool:
           name: Default
-          demands:
-            - agent.name -equals vm-linux-agent
         strategy:
           runOnce:
             deploy:
               steps:
                 - checkout: self
                 - script: |
-                    python3 -m pip install --upgrade pip --break-system-packages
-                    python3 -m pip install fabric-cicd --break-system-packages
+                    python3 -m venv .venv
+                    source .venv/bin/activate
+                    pip install --upgrade pip
+                    pip install fabric-cicd
                   displayName: "Install Fabric CICD Library"
                 - script: |
-                    python3 scripts/deploy/deploy-to-fabric.py --aztenantid $(aztenantid) --azclientid $(azclientid) --azspsecret $(azspsecret) --workspace_name $(mainWorkspaceName) --items_in_scope '${{ parameters.items_in_scope }}'
+                    source .venv/bin/activate
+                    python scripts/deploy/deploy-to-fabric.py --aztenantid $(aztenantid) --azclientid $(azclientid) --azspsecret $(azspsecret) --workspace_name $(mainWorkspaceName) --items_in_scope '${{ parameters.items_in_scope }}'
                   displayName: 'Deploy to Dev'
                 - ${{ if eq(parameters.run_post_deployment, true) }}:
                   - script: |
-                      python3 scripts/deploy/post_deployment.py --aztenantid $(aztenantid) --azclientid $(azclientid) --azspsecret $(azspsecret) --source_workspace_id $(mainWorkspaceName) --target_workspace_id $(mainWorkspaceName) --target_stage 1 --mapping_connections '${{ parameters.mapping_connections_file }}'
+                      source .venv/bin/activate
+                      python scripts/deploy/post_deployment.py --aztenantid $(aztenantid) --azclientid $(azclientid) --azspsecret $(azspsecret) --source_workspace_id $(mainWorkspaceName) --target_workspace_id $(mainWorkspaceName) --target_stage 1 --mapping_connections '${{ parameters.mapping_connections_file }}'
                     displayName: 'Post-Deployment: Rebind Dev'
+                # ============================================================
+                # SQL Schema (DACPAC) Build & Publish
+                # ============================================================
+                - ${{ if eq(parameters.deploy_sql_schemas, true) }}:
+                  - task: UseDotNet@2
+                    inputs:
+                      packageType: 'sdk'
+                      version: '8.x'
+                    displayName: "Set up .NET SDK"
+                  - script: |
+                      dotnet tool install -g microsoft.sqlpackage
+                      dotnet tool install -g PowerShell
+                      echo "##vso[task.prependpath]$HOME/.dotnet/tools"
+                    displayName: "Install SqlPackage & PowerShell Core"
+                  - pwsh: |
+                      # ============================================================
+                      # PHASE 1: BUILD LAKEHOUSE DACPACS
+                      # ============================================================
+                      function Get-TopoOrder {
+                        param([hashtable]$Nodes)
+                        $inDegree = @{}; $dependents = @{}
+                        foreach ($name in $Nodes.Keys) { $inDegree[$name] = 0; $dependents[$name] = [System.Collections.Generic.List[string]]::new() }
+                        foreach ($name in $Nodes.Keys) { foreach ($dep in $Nodes[$name]) { if ($Nodes.ContainsKey($dep)) { $inDegree[$name]++; $dependents[$dep].Add($name) | Out-Null } } }
+                        $ready = @($inDegree.GetEnumerator() | Where-Object { $_.Value -eq 0 } | ForEach-Object { $_.Key } | Sort-Object); $order = @()
+                        while ($ready.Count -gt 0) {
+                          $current = $ready[0]; $ready = if ($ready.Count -eq 1) { @() } else { $ready[1..($ready.Count - 1)] }; $order += $current
+                          foreach ($d in $dependents[$current]) { $inDegree[$d]--; if ($inDegree[$d] -eq 0) { $ready += $d; $ready = @($ready | Sort-Object) } }
+                        }
+                        if ($order.Count -ne $Nodes.Count) { Write-Host "##[warning]Dependency cycle detected"; return @($Nodes.Keys | Sort-Object) }
+                        return @($order)
+                      }
+
+                      $lakehouseDacpacRoot = "$(Build.SourcesDirectory)/.deploy/dacpacs/lakehouse"
+                      New-Item -ItemType Directory -Path $lakehouseDacpacRoot -Force | Out-Null
+
+                      $projectMap = @{}
+                      Get-ChildItem "$(Build.SourcesDirectory)/lakehouse-schema" -Recurse -Filter "*.sqlproj" -ErrorAction SilentlyContinue | ForEach-Object {
+                        $projectMap[[System.IO.Path]::GetFileNameWithoutExtension($_.Name)] = $_.FullName
+                      }
+
+                      if ($projectMap.Count -eq 0) {
+                        Write-Host "##[warning]No Lakehouse .sqlproj files found — skipping DACPAC build"
+                        Write-Host "##vso[task.setvariable variable=SKIP_DACPAC]true"
+                        return
+                      }
+
+                      # Auto-detect dependencies by scanning SQL files for cross-database references
+                      Write-Host "Auto-detecting lakehouse dependencies..."
+                      $dependencies = @{}
+                      foreach ($projName in $projectMap.Keys) {
+                        $projDir = Split-Path -Parent $projectMap[$projName]
+                        $referencedDatabases = @{}
+                        Get-ChildItem -Path $projDir -Recurse -Filter "*.sql" -ErrorAction SilentlyContinue | ForEach-Object {
+                          $content = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+                          if (-not $content) { return }
+                          [regex]::Matches($content, '\[([^\]]+)\]\.\[?([^\]\.]+)\]?\.\[?([^\]\.]+)\]?') | ForEach-Object {
+                            $dbName = $_.Groups[1].Value
+                            if ($dbName -ne $projName -and $dbName -notin @("sys","INFORMATION_SCHEMA","master","tempdb","msdb","model") -and $projectMap.ContainsKey($dbName)) {
+                              $referencedDatabases[$dbName] = $true
+                            }
+                          }
+                        }
+                        $dependencies[$projName] = @($referencedDatabases.Keys)
+                        if ($referencedDatabases.Count -gt 0) { Write-Host "  $projName -> $($referencedDatabases.Keys -join ', ')" }
+                      }
+
+                      $buildOrder = Get-TopoOrder -Nodes $dependencies
+                      foreach ($name in $buildOrder) {
+                        if (-not $projectMap.ContainsKey($name)) { continue }
+                        $path = $projectMap[$name]
+                        Write-Host "Building: $path"
+                        $outputPath = Join-Path $lakehouseDacpacRoot $name
+                        New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
+                        dotnet build $path -c Release -p:BuildProjectReferences=false -p:OutputPath=$outputPath
+                        if ($LASTEXITCODE -ne 0) { throw "Failed to build $name" }
+                      }
+                      Write-Host "All Lakehouse DACPACs built."
+                    displayName: "Build Lakehouse DACPACs"
+                  - pwsh: |
+                      if ("$(SKIP_DACPAC)" -eq "true") { Write-Host "Skipping — no sqlproj files found"; return }
+                      # ============================================================
+                      # PHASE 2: BUILD WAREHOUSE DACPAC
+                      # ============================================================
+                      $repoRoot = "$(Build.SourcesDirectory)"
+                      $lakehouseDacpacRoot = "$repoRoot/.deploy/dacpacs/lakehouse"
+
+                      # Find warehouse .sqlproj files under fabric/
+                      $projects = Get-ChildItem "$repoRoot/$(gitDirectory)" -Recurse -Filter "*.sqlproj" -ErrorAction SilentlyContinue
+                      if (-not $projects -or $projects.Count -eq 0) {
+                        Write-Host "##[warning]No Warehouse .sqlproj files found — skipping"
+                        return
+                      }
+
+                      # Temp copy to avoid modifying repo
+                      $tempRoot = "$repoRoot/.deploy/warehouse-build-tmp"
+                      if (Test-Path $tempRoot) { Remove-Item $tempRoot -Recurse -Force }
+                      New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+                      Copy-Item "$repoRoot/$(gitDirectory)" (Join-Path $tempRoot "$(gitDirectory)") -Recurse -Force
+                      if (Test-Path $lakehouseDacpacRoot) {
+                        New-Item -ItemType Directory -Path (Join-Path $tempRoot ".deploy/dacpacs") -Force | Out-Null
+                        Copy-Item $lakehouseDacpacRoot (Join-Path $tempRoot ".deploy/dacpacs/lakehouse") -Recurse -Force
+                      }
+
+                      # Add ArtifactReferences to warehouse projects pointing to lakehouse DACPACs
+                      $tempLakehouseDacpacs = @{}
+                      if (Test-Path (Join-Path $tempRoot ".deploy/dacpacs/lakehouse")) {
+                        Get-ChildItem -Path (Join-Path $tempRoot ".deploy/dacpacs/lakehouse") -Recurse -Filter "*.dacpac" | ForEach-Object {
+                          $tempLakehouseDacpacs[[System.IO.Path]::GetFileNameWithoutExtension($_.Name)] = $_.FullName
+                        }
+                      }
+
+                      $tempProjects = Get-ChildItem (Join-Path $tempRoot "$(gitDirectory)") -Recurse -Filter "*.sqlproj"
+                      foreach ($project in $tempProjects) {
+                        [xml]$projXml = Get-Content $project.FullName
+                        $ns = $projXml.DocumentElement.NamespaceURI
+                        foreach ($lhName in $tempLakehouseDacpacs.Keys) {
+                          $dacpacPath = $tempLakehouseDacpacs[$lhName]
+                          $relativePath = [System.IO.Path]::GetRelativePath($project.DirectoryName, $dacpacPath).Replace('\', '/')
+                          $existingRef = $projXml.SelectSingleNode("//ArtifactReference[DatabaseVariableLiteralValue='$lhName']", $null)
+                          if (-not $existingRef) {
+                            $itemGroup = $projXml.SelectSingleNode("//ItemGroup[ArtifactReference]", $null)
+                            if (-not $itemGroup) {
+                              $itemGroup = if ([string]::IsNullOrEmpty($ns)) { $projXml.CreateElement("ItemGroup") } else { $projXml.CreateElement("ItemGroup", $ns) }
+                              $projXml.DocumentElement.AppendChild($itemGroup) | Out-Null
+                            }
+                            $artifactRef = if ([string]::IsNullOrEmpty($ns)) { $projXml.CreateElement("ArtifactReference") } else { $projXml.CreateElement("ArtifactReference", $ns) }
+                            $artifactRef.SetAttribute("Include", $relativePath)
+                            $dbVarLit = if ([string]::IsNullOrEmpty($ns)) { $projXml.CreateElement("DatabaseVariableLiteralValue") } else { $projXml.CreateElement("DatabaseVariableLiteralValue", $ns) }
+                            $dbVarLit.InnerText = $lhName; $artifactRef.AppendChild($dbVarLit) | Out-Null
+                            $dbSqlCmd = if ([string]::IsNullOrEmpty($ns)) { $projXml.CreateElement("DatabaseSqlCmdVariable") } else { $projXml.CreateElement("DatabaseSqlCmdVariable", $ns) }
+                            $dbSqlCmd.InnerText = $lhName; $artifactRef.AppendChild($dbSqlCmd) | Out-Null
+                            $itemGroup.AppendChild($artifactRef) | Out-Null
+                            Write-Host "  Added ArtifactReference -> $lhName"
+                          }
+                        }
+                        $projXml.Save($project.FullName)
+                      }
+
+                      foreach ($project in $tempProjects) {
+                        Write-Host "Building: $($project.FullName)"
+                        Remove-Item "$($project.DirectoryName)/bin" -Recurse -Force -ErrorAction SilentlyContinue
+                        Remove-Item "$($project.DirectoryName)/obj" -Recurse -Force -ErrorAction SilentlyContinue
+
+                        # Remove scalar functions (not supported by Fabric)
+                        $functionsDir = Join-Path $project.DirectoryName "dbo/Functions"
+                        if (Test-Path $functionsDir) {
+                          Get-ChildItem -Path $functionsDir -Recurse -Filter "*.sql" | ForEach-Object {
+                            $content = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+                            if ($content -and $content -match 'RETURNS\s+(?!TABLE|@)') {
+                              Write-Host "  Removing scalar function: $($_.Name)"
+                              Remove-Item $_.FullName -Force
+                            }
+                          }
+                        }
+
+                        dotnet build $project.FullName -c Release `
+                          -p:BuildProjectReferences=true `
+                          -p:TreatWarningsAsErrors=false `
+                          -p:TreatUnresolvedReferenceToExternalDatabaseAsError=false `
+                          -p:ValidateBindings=false `
+                          -p:RunSqlCodeAnalysis=false `
+                          -p:SuppressTSqlWarnings=71561 `
+                          -p:SuppressWarnings=71561
+                        if ($LASTEXITCODE -ne 0) { throw "Failed to build $($project.Name)" }
+                      }
+
+                      # Copy built warehouse DACPACs back
+                      Get-ChildItem (Join-Path $tempRoot "$(gitDirectory)") -Recurse -Filter "*.dacpac" | ForEach-Object {
+                        $relative = $_.FullName.Substring((Join-Path $tempRoot "$(gitDirectory)").Length).TrimStart([char[]]"\\/")
+                        $destPath = Join-Path "$repoRoot/$(gitDirectory)" $relative
+                        New-Item -ItemType Directory -Path (Split-Path -Parent $destPath) -Force | Out-Null
+                        Copy-Item $_.FullName -Destination $destPath -Force
+                        Write-Host "  Copied DACPAC -> $destPath"
+                      }
+                    displayName: "Build Warehouse DACPAC"
+                  - pwsh: |
+                      if ("$(SKIP_DACPAC)" -eq "true") { Write-Host "Skipping — no sqlproj files found"; return }
+                      # ============================================================
+                      # PHASE 3: PUBLISH WAREHOUSE SCHEMA VIA SQLPACKAGE
+                      # ============================================================
+                      $dacpac = Get-ChildItem "$(Build.SourcesDirectory)/$(gitDirectory)" -Recurse -Filter "*.dacpac" | Select-Object -First 1
+                      if (-not $dacpac) { Write-Host "##[warning]No warehouse DACPAC found — skipping publish"; return }
+
+                      # Build reference paths for lakehouse DACPACs
+                      $lakehouseDacpacDir = "$(Build.SourcesDirectory)/.deploy/dacpacs/lakehouse"
+                      $referencePaths = @()
+                      if (Test-Path $lakehouseDacpacDir) {
+                        Get-ChildItem -Path $lakehouseDacpacDir -Recurse -Filter "*.dacpac" | ForEach-Object { $referencePaths += $_.DirectoryName }
+                      }
+                      $referencePathsArg = if ($referencePaths) { "/ReferencePaths:`"$($referencePaths -join ';')`"" } else { "" }
+
+                      $conn = "Server=tcp:$(FABRIC_WAREHOUSE_SERVER),1433;Database=$(FABRIC_WAREHOUSE_NAME);Authentication=Active Directory Service Principal;User Id=$(azclientid);Password=$(azspsecret);Encrypt=True;TrustServerCertificate=False;"
+                      Write-Host "Publishing warehouse DACPAC: $($dacpac.FullName)"
+                      $cmd = "sqlpackage /Action:Publish /SourceFile:`"$dacpac`" /TargetConnectionString:`"$conn`" /p:BlockOnPossibleDataLoss=false /p:DropObjectsNotInSource=true $referencePathsArg"
+                      Invoke-Expression $cmd
+                    displayName: "Publish Warehouse Schema"
+                  - pwsh: |
+                      if ("$(SKIP_DACPAC)" -eq "true") { Write-Host "Skipping — no sqlproj files found"; return }
+                      # ============================================================
+                      # PHASE 4: PUBLISH LAKEHOUSE SQL SCHEMAS
+                      # ============================================================
+                      $endpointsJson = $env:FABRIC_SQL_ENDPOINTS_JSON
+                      if (-not $endpointsJson -or $endpointsJson -eq "") {
+                        Write-Host "##[warning]No target SQL endpoints — skipping Lakehouse schema publish"
+                        return
+                      }
+
+                      $sqlEndpoints = $endpointsJson | ConvertFrom-Json
+                      $lakehouseDacpacRoot = "$(Build.SourcesDirectory)/.deploy/dacpacs/lakehouse"
+
+                      foreach ($endpoint in $sqlEndpoints) {
+                        $lakehouseName = $endpoint.displayName
+                        $dacpacFile = Get-ChildItem -Path "$lakehouseDacpacRoot/$lakehouseName" -Recurse -Filter "*.dacpac" -ErrorAction SilentlyContinue | Select-Object -First 1
+                        if ($dacpacFile) {
+                          Write-Host "Publishing $($dacpacFile.FullName) to $lakehouseName"
+                          $targetConn = "Server=tcp:$($endpoint.connectionString),1433;Database=$lakehouseName;Authentication=Active Directory Service Principal;User Id=$(azclientid);Password=$(azspsecret);Encrypt=True;TrustServerCertificate=False;"
+                          sqlpackage /Action:Publish /SourceFile:"$($dacpacFile.FullName)" /TargetConnectionString:"$targetConn" /p:ExcludeObjectTypes="Tables" /p:DropObjectsNotInSource=true
+                        } else {
+                          Write-Host "##[warning]No DACPAC found for $lakehouseName"
+                        }
+                      }
+                    displayName: "Publish Lakehouse SQL Schemas"
+                    env:
+                      FABRIC_SQL_ENDPOINTS_JSON: $(FABRIC_SQL_ENDPOINTS_TARGET)
 
   - stage: DeployToTest
     displayName: "Deploy to Test"
@@ -61,21 +294,211 @@ stages:
         environment: Test
         pool:
           name: Default
-          demands:
-            - agent.name -equals vm-linux-agent
         strategy:
           runOnce:
             deploy:
               steps:
                 - checkout: self
                 - script: |
-                    python3 -m pip install --upgrade pip --break-system-packages
-                    python3 -m pip install fabric-cicd --break-system-packages
+                    python3 -m venv .venv
+                    source .venv/bin/activate
+                    pip install --upgrade pip
+                    pip install fabric-cicd
                   displayName: "Install Fabric CICD Library"
                 - script: |
-                    python3 scripts/deploy/deploy-to-fabric.py --aztenantid $(aztenantid) --azclientid $(azclientid) --azspsecret $(azspsecret) --workspace_name $(testWorkspaceName) --items_in_scope '${{ parameters.items_in_scope }}'
+                    source .venv/bin/activate
+                    python scripts/deploy/deploy-to-fabric.py --aztenantid $(aztenantid) --azclientid $(azclientid) --azspsecret $(azspsecret) --workspace_name $(testWorkspaceName) --items_in_scope '${{ parameters.items_in_scope }}'
                   displayName: 'Deploy to Test'
                 - ${{ if eq(parameters.run_post_deployment, true) }}:
                   - script: |
-                      python3 scripts/deploy/post_deployment.py --aztenantid $(aztenantid) --azclientid $(azclientid) --azspsecret $(azspsecret) --source_workspace_id $(mainWorkspaceName) --target_workspace_id $(testWorkspaceName) --target_stage 2 --mapping_connections '${{ parameters.mapping_connections_file }}'
+                      source .venv/bin/activate
+                      python scripts/deploy/post_deployment.py --aztenantid $(aztenantid) --azclientid $(azclientid) --azspsecret $(azspsecret) --source_workspace_id $(mainWorkspaceName) --target_workspace_id $(testWorkspaceName) --target_stage 2 --mapping_connections '${{ parameters.mapping_connections_file }}'
                     displayName: 'Post-Deployment: Rebind Test'
+                # ============================================================
+                # SQL Schema (DACPAC) Build & Publish
+                # ============================================================
+                - ${{ if eq(parameters.deploy_sql_schemas, true) }}:
+                  - task: UseDotNet@2
+                    inputs:
+                      packageType: 'sdk'
+                      version: '8.x'
+                    displayName: "Set up .NET SDK"
+                  - script: |
+                      dotnet tool install -g microsoft.sqlpackage
+                      dotnet tool install -g PowerShell
+                      echo "##vso[task.prependpath]$HOME/.dotnet/tools"
+                    displayName: "Install SqlPackage & PowerShell Core"
+                  - pwsh: |
+                      # ============================================================
+                      # PHASE 1: BUILD LAKEHOUSE DACPACS
+                      # ============================================================
+                      function Get-TopoOrder {
+                        param([hashtable]$Nodes)
+                        $inDegree = @{}; $dependents = @{}
+                        foreach ($name in $Nodes.Keys) { $inDegree[$name] = 0; $dependents[$name] = [System.Collections.Generic.List[string]]::new() }
+                        foreach ($name in $Nodes.Keys) { foreach ($dep in $Nodes[$name]) { if ($Nodes.ContainsKey($dep)) { $inDegree[$name]++; $dependents[$dep].Add($name) | Out-Null } } }
+                        $ready = @($inDegree.GetEnumerator() | Where-Object { $_.Value -eq 0 } | ForEach-Object { $_.Key } | Sort-Object); $order = @()
+                        while ($ready.Count -gt 0) {
+                          $current = $ready[0]; $ready = if ($ready.Count -eq 1) { @() } else { $ready[1..($ready.Count - 1)] }; $order += $current
+                          foreach ($d in $dependents[$current]) { $inDegree[$d]--; if ($inDegree[$d] -eq 0) { $ready += $d; $ready = @($ready | Sort-Object) } }
+                        }
+                        if ($order.Count -ne $Nodes.Count) { Write-Host "##[warning]Dependency cycle detected"; return @($Nodes.Keys | Sort-Object) }
+                        return @($order)
+                      }
+
+                      $lakehouseDacpacRoot = "$(Build.SourcesDirectory)/.deploy/dacpacs/lakehouse"
+                      New-Item -ItemType Directory -Path $lakehouseDacpacRoot -Force | Out-Null
+
+                      $projectMap = @{}
+                      Get-ChildItem "$(Build.SourcesDirectory)/lakehouse-schema" -Recurse -Filter "*.sqlproj" -ErrorAction SilentlyContinue | ForEach-Object {
+                        $projectMap[[System.IO.Path]::GetFileNameWithoutExtension($_.Name)] = $_.FullName
+                      }
+
+                      if ($projectMap.Count -eq 0) {
+                        Write-Host "##[warning]No Lakehouse .sqlproj files found — skipping DACPAC build"
+                        Write-Host "##vso[task.setvariable variable=SKIP_DACPAC]true"
+                        return
+                      }
+
+                      Write-Host "Auto-detecting lakehouse dependencies..."
+                      $dependencies = @{}
+                      foreach ($projName in $projectMap.Keys) {
+                        $projDir = Split-Path -Parent $projectMap[$projName]
+                        $referencedDatabases = @{}
+                        Get-ChildItem -Path $projDir -Recurse -Filter "*.sql" -ErrorAction SilentlyContinue | ForEach-Object {
+                          $content = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+                          if (-not $content) { return }
+                          [regex]::Matches($content, '\[([^\]]+)\]\.\[?([^\]\.]+)\]?\.\[?([^\]\.]+)\]?') | ForEach-Object {
+                            $dbName = $_.Groups[1].Value
+                            if ($dbName -ne $projName -and $dbName -notin @("sys","INFORMATION_SCHEMA","master","tempdb","msdb","model") -and $projectMap.ContainsKey($dbName)) {
+                              $referencedDatabases[$dbName] = $true
+                            }
+                          }
+                        }
+                        $dependencies[$projName] = @($referencedDatabases.Keys)
+                        if ($referencedDatabases.Count -gt 0) { Write-Host "  $projName -> $($referencedDatabases.Keys -join ', ')" }
+                      }
+
+                      $buildOrder = Get-TopoOrder -Nodes $dependencies
+                      foreach ($name in $buildOrder) {
+                        if (-not $projectMap.ContainsKey($name)) { continue }
+                        $path = $projectMap[$name]
+                        Write-Host "Building: $path"
+                        $outputPath = Join-Path $lakehouseDacpacRoot $name
+                        New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
+                        dotnet build $path -c Release -p:BuildProjectReferences=false -p:OutputPath=$outputPath
+                        if ($LASTEXITCODE -ne 0) { throw "Failed to build $name" }
+                      }
+                      Write-Host "All Lakehouse DACPACs built."
+                    displayName: "Build Lakehouse DACPACs"
+                  - pwsh: |
+                      if ("$(SKIP_DACPAC)" -eq "true") { Write-Host "Skipping — no sqlproj files found"; return }
+                      $repoRoot = "$(Build.SourcesDirectory)"
+                      $lakehouseDacpacRoot = "$repoRoot/.deploy/dacpacs/lakehouse"
+                      $projects = Get-ChildItem "$repoRoot/$(gitDirectory)" -Recurse -Filter "*.sqlproj" -ErrorAction SilentlyContinue
+                      if (-not $projects -or $projects.Count -eq 0) { Write-Host "##[warning]No Warehouse .sqlproj — skipping"; return }
+
+                      $tempRoot = "$repoRoot/.deploy/warehouse-build-tmp"
+                      if (Test-Path $tempRoot) { Remove-Item $tempRoot -Recurse -Force }
+                      New-Item -ItemType Directory -Path $tempRoot -Force | Out-Null
+                      Copy-Item "$repoRoot/$(gitDirectory)" (Join-Path $tempRoot "$(gitDirectory)") -Recurse -Force
+                      if (Test-Path $lakehouseDacpacRoot) {
+                        New-Item -ItemType Directory -Path (Join-Path $tempRoot ".deploy/dacpacs") -Force | Out-Null
+                        Copy-Item $lakehouseDacpacRoot (Join-Path $tempRoot ".deploy/dacpacs/lakehouse") -Recurse -Force
+                      }
+
+                      $tempLakehouseDacpacs = @{}
+                      if (Test-Path (Join-Path $tempRoot ".deploy/dacpacs/lakehouse")) {
+                        Get-ChildItem -Path (Join-Path $tempRoot ".deploy/dacpacs/lakehouse") -Recurse -Filter "*.dacpac" | ForEach-Object {
+                          $tempLakehouseDacpacs[[System.IO.Path]::GetFileNameWithoutExtension($_.Name)] = $_.FullName
+                        }
+                      }
+
+                      $tempProjects = Get-ChildItem (Join-Path $tempRoot "$(gitDirectory)") -Recurse -Filter "*.sqlproj"
+                      foreach ($project in $tempProjects) {
+                        [xml]$projXml = Get-Content $project.FullName
+                        $ns = $projXml.DocumentElement.NamespaceURI
+                        foreach ($lhName in $tempLakehouseDacpacs.Keys) {
+                          $dacpacPath = $tempLakehouseDacpacs[$lhName]
+                          $relativePath = [System.IO.Path]::GetRelativePath($project.DirectoryName, $dacpacPath).Replace('\', '/')
+                          $existingRef = $projXml.SelectSingleNode("//ArtifactReference[DatabaseVariableLiteralValue='$lhName']", $null)
+                          if (-not $existingRef) {
+                            $itemGroup = $projXml.SelectSingleNode("//ItemGroup[ArtifactReference]", $null)
+                            if (-not $itemGroup) {
+                              $itemGroup = if ([string]::IsNullOrEmpty($ns)) { $projXml.CreateElement("ItemGroup") } else { $projXml.CreateElement("ItemGroup", $ns) }
+                              $projXml.DocumentElement.AppendChild($itemGroup) | Out-Null
+                            }
+                            $artifactRef = if ([string]::IsNullOrEmpty($ns)) { $projXml.CreateElement("ArtifactReference") } else { $projXml.CreateElement("ArtifactReference", $ns) }
+                            $artifactRef.SetAttribute("Include", $relativePath)
+                            $dbVarLit = if ([string]::IsNullOrEmpty($ns)) { $projXml.CreateElement("DatabaseVariableLiteralValue") } else { $projXml.CreateElement("DatabaseVariableLiteralValue", $ns) }
+                            $dbVarLit.InnerText = $lhName; $artifactRef.AppendChild($dbVarLit) | Out-Null
+                            $dbSqlCmd = if ([string]::IsNullOrEmpty($ns)) { $projXml.CreateElement("DatabaseSqlCmdVariable") } else { $projXml.CreateElement("DatabaseSqlCmdVariable", $ns) }
+                            $dbSqlCmd.InnerText = $lhName; $artifactRef.AppendChild($dbSqlCmd) | Out-Null
+                            $itemGroup.AppendChild($artifactRef) | Out-Null
+                          }
+                        }
+                        $projXml.Save($project.FullName)
+                      }
+
+                      foreach ($project in $tempProjects) {
+                        Write-Host "Building: $($project.FullName)"
+                        Remove-Item "$($project.DirectoryName)/bin" -Recurse -Force -ErrorAction SilentlyContinue
+                        Remove-Item "$($project.DirectoryName)/obj" -Recurse -Force -ErrorAction SilentlyContinue
+                        $functionsDir = Join-Path $project.DirectoryName "dbo/Functions"
+                        if (Test-Path $functionsDir) {
+                          Get-ChildItem -Path $functionsDir -Recurse -Filter "*.sql" | ForEach-Object {
+                            $content = Get-Content $_.FullName -Raw -ErrorAction SilentlyContinue
+                            if ($content -and $content -match 'RETURNS\s+(?!TABLE|@)') { Remove-Item $_.FullName -Force }
+                          }
+                        }
+                        dotnet build $project.FullName -c Release `
+                          -p:BuildProjectReferences=true -p:TreatWarningsAsErrors=false `
+                          -p:TreatUnresolvedReferenceToExternalDatabaseAsError=false `
+                          -p:ValidateBindings=false -p:RunSqlCodeAnalysis=false `
+                          -p:SuppressTSqlWarnings=71561 -p:SuppressWarnings=71561
+                        if ($LASTEXITCODE -ne 0) { throw "Failed to build $($project.Name)" }
+                      }
+
+                      Get-ChildItem (Join-Path $tempRoot "$(gitDirectory)") -Recurse -Filter "*.dacpac" | ForEach-Object {
+                        $relative = $_.FullName.Substring((Join-Path $tempRoot "$(gitDirectory)").Length).TrimStart([char[]]"\\/")
+                        $destPath = Join-Path "$repoRoot/$(gitDirectory)" $relative
+                        New-Item -ItemType Directory -Path (Split-Path -Parent $destPath) -Force | Out-Null
+                        Copy-Item $_.FullName -Destination $destPath -Force
+                        Write-Host "  Copied DACPAC -> $destPath"
+                      }
+                    displayName: "Build Warehouse DACPAC"
+                  - pwsh: |
+                      if ("$(SKIP_DACPAC)" -eq "true") { Write-Host "Skipping — no sqlproj files found"; return }
+                      $dacpac = Get-ChildItem "$(Build.SourcesDirectory)/$(gitDirectory)" -Recurse -Filter "*.dacpac" | Select-Object -First 1
+                      if (-not $dacpac) { Write-Host "##[warning]No warehouse DACPAC — skipping"; return }
+                      $lakehouseDacpacDir = "$(Build.SourcesDirectory)/.deploy/dacpacs/lakehouse"
+                      $referencePaths = @()
+                      if (Test-Path $lakehouseDacpacDir) { Get-ChildItem -Path $lakehouseDacpacDir -Recurse -Filter "*.dacpac" | ForEach-Object { $referencePaths += $_.DirectoryName } }
+                      $referencePathsArg = if ($referencePaths) { "/ReferencePaths:`"$($referencePaths -join ';')`"" } else { "" }
+                      $conn = "Server=tcp:$(FABRIC_WAREHOUSE_SERVER),1433;Database=$(FABRIC_WAREHOUSE_NAME);Authentication=Active Directory Service Principal;User Id=$(azclientid);Password=$(azspsecret);Encrypt=True;TrustServerCertificate=False;"
+                      Write-Host "Publishing warehouse DACPAC: $($dacpac.FullName)"
+                      $cmd = "sqlpackage /Action:Publish /SourceFile:`"$dacpac`" /TargetConnectionString:`"$conn`" /p:BlockOnPossibleDataLoss=false /p:DropObjectsNotInSource=true $referencePathsArg"
+                      Invoke-Expression $cmd
+                    displayName: "Publish Warehouse Schema"
+                  - pwsh: |
+                      if ("$(SKIP_DACPAC)" -eq "true") { Write-Host "Skipping — no sqlproj files found"; return }
+                      $endpointsJson = $env:FABRIC_SQL_ENDPOINTS_JSON
+                      if (-not $endpointsJson -or $endpointsJson -eq "") {
+                        Write-Host "##[warning]No target SQL endpoints — skipping Lakehouse schema publish"; return
+                      }
+                      $sqlEndpoints = $endpointsJson | ConvertFrom-Json
+                      $lakehouseDacpacRoot = "$(Build.SourcesDirectory)/.deploy/dacpacs/lakehouse"
+                      foreach ($endpoint in $sqlEndpoints) {
+                        $lakehouseName = $endpoint.displayName
+                        $dacpacFile = Get-ChildItem -Path "$lakehouseDacpacRoot/$lakehouseName" -Recurse -Filter "*.dacpac" -ErrorAction SilentlyContinue | Select-Object -First 1
+                        if ($dacpacFile) {
+                          Write-Host "Publishing $($dacpacFile.FullName) to $lakehouseName"
+                          $targetConn = "Server=tcp:$($endpoint.connectionString),1433;Database=$lakehouseName;Authentication=Active Directory Service Principal;User Id=$(azclientid);Password=$(azspsecret);Encrypt=True;TrustServerCertificate=False;"
+                          sqlpackage /Action:Publish /SourceFile:"$($dacpacFile.FullName)" /TargetConnectionString:"$targetConn" /p:ExcludeObjectTypes="Tables" /p:DropObjectsNotInSource=true
+                        } else {
+                          Write-Host "##[warning]No DACPAC found for $lakehouseName"
+                        }
+                      }
+                    displayName: "Publish Lakehouse SQL Schemas"
+                    env:
+                      FABRIC_SQL_ENDPOINTS_JSON: $(FABRIC_SQL_ENDPOINTS_TARGET)
